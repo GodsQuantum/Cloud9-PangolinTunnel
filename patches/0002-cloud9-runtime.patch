@@ -1,0 +1,166 @@
+diff --git a/Dockerfile b/Dockerfile
+index 8cae710..45643f2 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -1,24 +1,12 @@
+-FROM golang:1.23 as builder
+-
++FROM golang:1.27-alpine AS builder
++RUN apk add --no-cache ca-certificates
+ WORKDIR /build
+-
+-# Copy go.mod and go.sum first for better layer caching
+ COPY go.mod go.sum ./
+-RUN go mod download
+-
+-# Copy the source code
++RUN --mount=type=cache,target=/go/pkg/mod go mod download
+ COPY . .
+-
+-# Build the application
+-RUN CGO_ENABLED=0 GOOS=linux go build -o pangolin-cloudflare-tunnel .
+-
+-# Create final image
++RUN --mount=type=cache,target=/root/.cache/go-build CGO_ENABLED=0 GOOS=linux go build -trimpath -buildvcs=false -ldflags="-s -w" -o /out/pangolin-cloudflare-tunnel .
+ FROM scratch
+-
+-# Copy SSL certificates for HTTPS requests
+ COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+-
+-# Copy the binary from the builder stage
+-COPY --from=builder /build/pangolin-cloudflare-tunnel /pangolin-cloudflare-tunnel
+-
+-ENTRYPOINT ["/pangolin-cloudflare-tunnel"]
+\ No newline at end of file
++COPY --from=builder /out/pangolin-cloudflare-tunnel /pangolin-cloudflare-tunnel
++USER 65532:65532
++ENTRYPOINT ["/pangolin-cloudflare-tunnel"]
+diff --git a/internal/cloudflare/ingress.go b/internal/cloudflare/ingress.go
+index 5ac290f..b5a83db 100644
+--- a/internal/cloudflare/ingress.go
++++ b/internal/cloudflare/ingress.go
+@@ -74,7 +74,7 @@ func BuildIngressRules(routers []traefik.Router, cfg *config.Config) (*IngressRe
+ 			}).Info("Adding domain to tunnel configuration")
+ 
+ 			// Create origin request config with TLS verification settings
+-			noTLSVerify := true
++			noTLSVerify := false
+ 			originRequest := &cloudflare.OriginRequestConfig{
+ 				HTTPHostHeader:   &domain,
+ 				NoTLSVerify:      &noTLSVerify,
+diff --git a/internal/config/config.go b/internal/config/config.go
+index c2f1c09..fdb6c81 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -33,6 +33,25 @@ type ZoneConfig struct {
+ 	DomainName string
+ }
+ 
++func envOrFile(key string) string {
++	if value := os.Getenv(key); value != "" {
++		return value
++	}
++
++	path := os.Getenv(key + "_FILE")
++	if path == "" {
++		return ""
++	}
++
++	data, err := os.ReadFile(path)
++	if err != nil {
++		log.WithError(err).Warnf("Unable to read %s_FILE", key)
++		return ""
++	}
++
++	return strings.TrimSpace(string(data))
++}
++
+ // Load loads configuration from environment variables
+ func Load() (*Config, error) {
+ 	// Parse TraefikEntrypoints from comma-separated list
+@@ -97,7 +116,7 @@ func Load() (*Config, error) {
+ 	}
+ 
+ 	config := &Config{
+-		CloudflareToken:        os.Getenv("CLOUDFLARE_API_TOKEN"),
++		CloudflareToken:        envOrFile("CLOUDFLARE_API_TOKEN"),
+ 		CloudflareAccountID:    os.Getenv("CLOUDFLARE_ACCOUNT_ID"),
+ 		CloudflareTunnelID:     os.Getenv("CLOUDFLARE_TUNNEL_ID"),
+ 		CloudflareZones:        zones,
+diff --git a/internal/traefik/router.go b/internal/traefik/router.go
+index f385590..df0317f 100644
+--- a/internal/traefik/router.go
++++ b/internal/traefik/router.go
+@@ -7,6 +7,12 @@ import (
+ 	"github.com/traefik/traefik/v3/pkg/muxer/http"
+ )
+ 
++// TLSDomain represents the current Traefik TLS domain structure.
++type TLSDomain struct {
++	Main string   `json:"main"`
++	Sans []string `json:"sans,omitempty"`
++}
++
+ // Router represents a Traefik router configuration
+ type Router struct {
+ 	EntryPoints []string `json:"entryPoints"`
+@@ -18,9 +24,9 @@ type Router struct {
+ 	Provider    string   `json:"provider"`
+ 	Middlewares []string `json:"middlewares,omitempty"`
+ 	TLS         struct {
+-		CertResolver string   `json:"certResolver"`
+-		Options      string   `json:"options"`
+-		Domains      []string `json:"domains,omitempty"`
++		CertResolver string      `json:"certResolver"`
++		Options      string      `json:"options"`
++		Domains      []TLSDomain `json:"domains,omitempty"`
+ 	} `json:"tls,omitempty"`
+ 	Priority int `json:"priority,omitempty"`
+ }
+diff --git a/internal/traefik/router_test.go b/internal/traefik/router_test.go
+index 215b43d..0e7942d 100644
+--- a/internal/traefik/router_test.go
++++ b/internal/traefik/router_test.go
+@@ -12,9 +12,9 @@ func TestRouter_HasTLSEnabled(t *testing.T) {
+ 			name: "TLS with CertResolver and Options",
+ 			router: Router{
+ 				TLS: struct {
+-					CertResolver string   `json:"certResolver"`
+-					Options      string   `json:"options"`
+-					Domains      []string `json:"domains,omitempty"`
++					CertResolver string      `json:"certResolver"`
++					Options      string      `json:"options"`
++					Domains      []TLSDomain `json:"domains,omitempty"`
+ 				}{
+ 					CertResolver: "letsencrypt",
+ 					Options:      "default",
+@@ -26,12 +26,12 @@ func TestRouter_HasTLSEnabled(t *testing.T) {
+ 			name: "TLS with CertResolver and Domains",
+ 			router: Router{
+ 				TLS: struct {
+-					CertResolver string   `json:"certResolver"`
+-					Options      string   `json:"options"`
+-					Domains      []string `json:"domains,omitempty"`
++					CertResolver string      `json:"certResolver"`
++					Options      string      `json:"options"`
++					Domains      []TLSDomain `json:"domains,omitempty"`
+ 				}{
+ 					CertResolver: "letsencrypt",
+-					Domains:      []string{"example.com"},
++					Domains:      []TLSDomain{{Main: "example.com"}},
+ 				},
+ 			},
+ 			expected: true,
+@@ -40,9 +40,9 @@ func TestRouter_HasTLSEnabled(t *testing.T) {
+ 			name: "TLS with only CertResolver",
+ 			router: Router{
+ 				TLS: struct {
+-					CertResolver string   `json:"certResolver"`
+-					Options      string   `json:"options"`
+-					Domains      []string `json:"domains,omitempty"`
++					CertResolver string      `json:"certResolver"`
++					Options      string      `json:"options"`
++					Domains      []TLSDomain `json:"domains,omitempty"`
+ 				}{
+ 					CertResolver: "letsencrypt",
+ 				},

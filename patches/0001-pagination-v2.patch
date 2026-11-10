@@ -1,0 +1,75 @@
+From 9a16a8c38e2a40c852082862075b4b98462cc075 Mon Sep 17 00:00:00 2001
+From: Cloud9 Platform <dev@cloud9.local>
+Date: Sun, 1 Nov 2026 03:34:37 +0100
+Subject: [PATCH] fix(traefik): paginate router discovery beyond first hundred
+
+---
+ internal/traefik/client.go | 45 ++++++++++++++++++++++++++++----------
+ 1 file changed, 34 insertions(+), 11 deletions(-)
+
+diff --git a/internal/traefik/client.go b/internal/traefik/client.go
+index b0b8b5f..f57531f 100644
+--- a/internal/traefik/client.go
++++ b/internal/traefik/client.go
+@@ -1,6 +1,9 @@
+ package traefik
+ 
+ import (
++	"fmt"
++	"strconv"
++
+ 	"github.com/go-resty/resty/v2"
+ )
+ 
+@@ -16,17 +19,37 @@ func NewClient(apiEndpoint string) *Client {
+ 	}
+ }
+ 
+-// GetRouters fetches all HTTP routers from the Traefik API
++// GetRouters fetches every Traefik HTTP router, not only its default first page.
++// Traefik defaults to 100 routers per page; exceeding that silently hid public
++// domains from the Cloudflare tunnel synchronizer.
+ func (c *Client) GetRouters() ([]Router, error) {
+-	var routers []Router
+-	_, err := c.resty.R().
+-		EnableTrace().
+-		SetResult(&routers).
+-		Get("/api/http/routers")
+-
+-	if err != nil {
+-		return nil, err
++	const perPage = 100
++	routers := make([]Router, 0, perPage)
++	for page := 1; page <= 100; page++ {
++		var batch []Router
++		response, err := c.resty.R().
++			SetResult(&batch).
++			SetQueryParams(map[string]string{
++				"page":     strconv.Itoa(page),
++				"per_page": strconv.Itoa(perPage),
++			}).
++			Get("/api/http/routers")
++		if err != nil {
++			return nil, err
++		}
++		if response.IsError() {
++			return nil, fmt.Errorf("traefik routers page %d: HTTP %d", page, response.StatusCode())
++		}
++		routers = append(routers, batch...)
++		if len(batch) < perPage {
++			return routers, nil
++		}
++		// On some Traefik versions X-Next-Page points back to the previous
++		// page on the last page; avoid endlessly fetching duplicate pages.
++		next, err := strconv.Atoi(response.Header().Get("X-Next-Page"))
++		if err != nil || next <= page {
++			return routers, nil
++		}
+ 	}
+-
+-	return routers, nil
++	return nil, fmt.Errorf("traefik router pagination exceeded 100 pages")
+ }
+-- 
+2.47.3
+
