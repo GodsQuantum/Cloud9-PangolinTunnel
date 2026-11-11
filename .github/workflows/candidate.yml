@@ -1,0 +1,101 @@
+name: Build tested Pangolin Tunnel GHCR candidate
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'patches/**'
+      - 'docs/**'
+      - 'README*'
+      - '.github/workflows/candidate.yml'
+  schedule:
+    - cron: "18 4 * * 0"
+  workflow_dispatch:
+permissions:
+  contents: read
+  packages: write
+concurrency:
+  group: pangolin-tunnel-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  test-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Privacy and patch-source checks
+        run: python3 scripts/check_privacy.py
+      - name: Fetch unmodified current upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch main https://github.com/hhftechnology/pangolin-cloudflare-tunnel.git upstream
+          UPSTREAM_SHA="$(git -C upstream rev-parse HEAD)"
+          echo "UPSTREAM_SHA=$UPSTREAM_SHA" >> "$GITHUB_ENV"
+          echo "CANDIDATE_REF=ghcr.io/godsquantum/cloud9-pangolin-tunnel:upstream-${UPSTREAM_SHA:0:12}-patch-${GITHUB_SHA:0:12}-run-${GITHUB_RUN_ID}" >> "$GITHUB_ENV"
+          echo "SOURCE_SHA=$UPSTREAM_SHA"
+      - name: Apply exactly two maintained patches
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd upstream
+          git apply --check ../patches/0001-pagination-v2.patch
+          git apply ../patches/0001-pagination-v2.patch
+          git apply --check ../patches/0002-cloud9-runtime.patch
+          git apply ../patches/0002-cloud9-runtime.patch
+          git diff --check
+          grep -Fq 'NoTLSVerify:      &noTLSVerify' internal/cloudflare/ingress.go
+          grep -Fq 'noTLSVerify := false' internal/cloudflare/ingress.go
+          grep -Fq 'envOrFile("CLOUDFLARE_API_TOKEN")' internal/config/config.go
+          grep -Fq 'perPage = 100' internal/traefik/client.go
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.27.x"
+          check-latest: true
+          cache-dependency-path: upstream/go.sum
+      - name: Upstream Go test suite and static checks
+        working-directory: upstream
+        run: |
+          go test ./...
+          go vet ./...
+          go build -trimpath -o /tmp/pangolin-cloudflare-tunnel .
+          test -s /tmp/pangolin-cloudflare-tunnel
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and load amd64 candidate
+        uses: docker/build-push-action@v6
+        with:
+          context: ./upstream
+          file: ./upstream/Dockerfile
+          pull: true
+          load: true
+          platforms: linux/amd64
+          tags: ${{ env.CANDIDATE_REF }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/GodsQuantum/Cloud9-PangolinTunnel
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.title=Cloud9-PangolinTunnel
+            org.opencontainers.image.description=Paginated Traefik routes, verified TLS and Docker Secrets
+            com.cloud9.upstream.revision=${{ env.UPSTREAM_SHA }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Verify OCI provenance and rootless scratch runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref="$CANDIDATE_REF"
+          test "$(docker image inspect "$ref" --format '{{index .Config.Labels "com.cloud9.upstream.revision"}}')" = "$UPSTREAM_SHA"
+          test "$(docker image inspect "$ref" --format '{{.Config.User}}')" = "65532:65532"
+          test "$(docker image inspect "$ref" --format '{{index .Config.Labels "org.opencontainers.image.source"}}')" = "https://github.com/GodsQuantum/Cloud9-PangolinTunnel"
+          test "$(docker image inspect "$ref" --format '{{.Config.Entrypoint}}')" = "[/pangolin-cloudflare-tunnel]"
+          echo PANGOLIN_GHCR_SOURCE_USER_RUNTIME_PASS
+      - name: Publish tested candidate, not production latest
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker push "$CANDIDATE_REF"
+          echo "CANDIDATE_READY=$CANDIDATE_REF" >> "$GITHUB_STEP_SUMMARY"
+          echo "Do not deploy to a live tunnel until DNS, TLS and Cloudflare ingress equivalence tests pass." >> "$GITHUB_STEP_SUMMARY"
